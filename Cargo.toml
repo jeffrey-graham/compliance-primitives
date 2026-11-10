@@ -27,6 +27,7 @@ members = [
     "examples/policy-engine-audit",
     "examples/rwa-compliance-flow",
     "examples/rwa-token",
+    "examples/rwa-token-aggregator",
 ]
 
 [workspace.package]
