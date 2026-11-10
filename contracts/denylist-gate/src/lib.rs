@@ -83,10 +83,15 @@ enum DataKey {
     Paused,
     ComplianceOfficer,
     AuditLog,
+    /// Optional M-of-N [`SignerSet`] stored in **instance storage**
+    /// (`env.storage().instance()`) alongside `DataKey::Admin`, `DataKey::Paused`,
+    /// and `DataKey::ComplianceOfficer`. Absent until [`DenylistGate::initialize_multisig`]
+    /// is called by the current admin.
     SignerSet,
     Denied(Address),
     PendingUpgrade,
-    /// Approvals collected so far for one pending signer-set change.
+    /// Approvals (`Vec<Address>`) collected so far for one pending [`SignerAction`].
+    /// Stored in instance storage and removed once the action reaches [`SignerSet::threshold`].
     PendingSignerAction(SignerAction),
 }
 
@@ -101,11 +106,41 @@ pub struct UpgradeState {
 /// Current on-chain schema version for this contract instance.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// The M-of-N signer set.
+/// On-chain M-of-N signer-set configuration stored under [`DataKey::SignerSet`]
+/// in **instance storage** (`env.storage().instance()`).
+///
+/// ### Storage shape and invariants
+/// - Stored as a single XDR-serialized struct in the contract's instance map,
+///   sharing the contract instance's single TTL alongside `DataKey::Admin`,
+///   `DataKey::Paused`, and `DataKey::ComplianceOfficer`.
+/// - `signers` is always non-empty and free of duplicate addresses (`1 <= signers.len()`).
+/// - `threshold` always satisfies `1 <= threshold <= signers.len()`. Both
+///   [`DenylistGate::initialize_multisig`] and subsequent [`DenylistGate::remove_signer`] /
+///   [`DenylistGate::set_threshold`] transitions enforce these bounds and reject
+///   violations with [`Error::InvalidSignerSet`] or [`Error::InvalidThreshold`].
+///
+/// ### Relationship to single-admin mode (`DataKey::Admin`) and `DataKey::ComplianceOfficer`
+/// - `initialize(admin)` sets `DataKey::Admin` first; `initialize_multisig(admin, signers, threshold)`
+///   is an optional post-initialization step gated by `require_admin` that installs
+///   `DataKey::SignerSet` without clearing `DataKey::Admin` or `DataKey::ComplianceOfficer`.
+/// - Signer-set lifecycle entrypoints (`add_signer`, `remove_signer`, `set_threshold`)
+///   require the caller to be a member of `SignerSet::signers` (`require_signer`) and
+///   accumulate approvals under `DataKey::PendingSignerAction(SignerAction)` until
+///   `threshold` distinct current signers have approved.
+/// - Single-admin and compliance-authority entrypoints (`add_to_denylist`,
+///   `remove_from_denylist`, `pause`, `unpause`, `set_compliance_officer`,
+///   `propose_admin`, `propose_upgrade`) continue to check `require_admin` or
+///   `require_compliance_authority` (`DataKey::Admin` / `DataKey::ComplianceOfficer`)
+///   unless multisig authorization is explicitly wired into those paths (see #386).
 #[contracttype]
 #[derive(Clone)]
 pub struct SignerSet {
+    /// Ordered, deduplicated list of addresses authorized to vote on [`SignerAction`]
+    /// proposals via [`DenylistGate::add_signer`], [`DenylistGate::remove_signer`],
+    /// and [`DenylistGate::set_threshold`].
     pub signers: Vec<Address>,
+    /// Number of distinct current signers (`1 <= threshold <= signers.len()`)
+    /// that must approve a [`SignerAction`] before it takes effect.
     pub threshold: u32,
 }
 
@@ -640,10 +675,21 @@ impl DenylistGate {
         !Self::check(env, address)
     }
 
-    /// Install an M-of-N signer set. Admin-only; callable once.
+    /// Install an M-of-N [`SignerSet`] in instance storage under [`DataKey::SignerSet`].
+    /// Admin-only (`require_admin`); callable at most once after [`Self::initialize`].
     ///
-    /// `signers` must be non-empty and free of duplicates, and `threshold`
-    /// must be between 1 and `signers.len()`.
+    /// ### Invariants
+    /// - `signers` must be non-empty and free of duplicates (otherwise returns
+    ///   [`Error::InvalidSignerSet`]).
+    /// - `threshold` must satisfy `1 <= threshold <= signers.len()` (otherwise
+    ///   returns [`Error::InvalidThreshold`]).
+    /// - Calling `initialize_multisig` a second time returns [`Error::AlreadyInitialized`].
+    ///
+    /// ### Interaction with `DataKey::Admin` and `DataKey::ComplianceOfficer`
+    /// Installing `DataKey::SignerSet` enables M-of-N governance for signer-set
+    /// mutations (`add_signer`, `remove_signer`, `set_threshold`) while leaving
+    /// `DataKey::Admin` and any configured `DataKey::ComplianceOfficer` intact in
+    /// instance storage.
     pub fn initialize_multisig(
         env: Env,
         admin: Address,
