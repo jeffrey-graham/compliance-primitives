@@ -465,6 +465,15 @@ impl ComplianceAggregator {
     // Read helpers
     // -----------------------------------------------------------------------
 
+    /// Returns the current admin address, or `Err(Error::NotInitialized)` if
+    /// the contract has not yet been initialized.
+    pub fn get_admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
+
     /// Returns the currently registered `denylist-gate` address, if any.
     pub fn denylist_gate(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::DenylistGate)

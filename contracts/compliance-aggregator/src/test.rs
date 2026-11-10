@@ -1178,3 +1178,25 @@ fn test_every_admin_write_path_extends_instance_ttl() {
     client.set_admin(&agg_admin, &new_admin);
     assert_eq!(instance_ttl(&env, &agg_id), INSTANCE_TTL_EXTEND_TO);
 }
+
+#[test]
+fn test_get_admin_returns_initial_and_updated_admin() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let agg_id = env.register(ComplianceAggregator, ());
+    let client = ComplianceAggregatorClient::new(&env, &agg_id);
+
+    // Before initialize, get_admin returns Error::NotInitialized.
+    assert_eq!(client.try_get_admin(), Err(Ok(Error::NotInitialized)));
+
+    let admin = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+    client.initialize(&admin, &None, &None, &None);
+
+    assert_eq!(client.get_admin(), admin);
+
+    client.set_admin(&admin, &new_admin);
+    assert_eq!(client.get_admin(), new_admin);
+}
+
