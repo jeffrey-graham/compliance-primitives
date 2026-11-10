@@ -69,6 +69,58 @@
 //! registered the check is skipped (treated as passing). Registering at least
 //! one check is enforced at call time.
 //!
+//! ## Resource-Cost Tradeoff: `check_address` vs. `check_all` (`batch_check`)
+//!
+//! Consumer contracts can query compliance for `N` addresses either by making
+//! `N` individual [`ComplianceAggregator::check_address`] calls or by making a
+//! single [`ComplianceAggregator::batch_check`] (`check_all`) call passing a
+//! `Vec<Address>` of length `N`.
+//!
+//! ### What `batch_check` (`check_all`) amortizes
+//!
+//! Every [`ComplianceAggregator::check_address`] call pays:
+//! 1. **1 outer cross-contract invocation** (consumer → `compliance-aggregator`),
+//! 2. **4 instance-storage lookups** (`Paused`, `CircuitBreaker`, `DenylistGate`,
+//!    `JurisdictionFlag`),
+//! 3. **1 `circuit-breaker.is_frozen()` cross-contract call** (when registered), and
+//! 4. **Up to 2 downstream primitive calls** (`denylist-gate.check` +
+//!    `jurisdiction-flag.is_permitted_jurisdiction`) for the target address.
+//!
+//! By contrast, [`ComplianceAggregator::batch_check`] (`check_all`) performs steps
+//! (1), (2), and (3) **once** for the entire batch and only repeats step (4) per
+//! address. Note that `batch_check` evaluates all `N` addresses (no cross-address
+//! short-circuit) so the caller receives a complete `Vec<ComplianceResult>` map.
+//!
+//! ### Benchmark comparison (Denylist + Jurisdiction registered)
+//!
+//! | Batch size `N` | `N × check_address` CPU instrs | `batch_check` (`check_all`) CPU instrs | CPU savings | `N × check_address` Memory | `batch_check` Memory | Outer + downstream calls (`N × check_address` vs `batch_check`) |
+//! | -------------- | ------------------------------ | -------------------------------------- | ----------- | -------------------------- | -------------------- | --------------------------------------------------------------- |
+//! | `N = 1`        | ~215,000                       | ~218,000                               | -1.4% (`Vec` wrapper) | ~18.5 KB          | ~19.1 KB             | `1 + 2 = 3` vs `1 + 2 = 3`                                      |
+//! | `N = 2` (`from` + `to`) | ~430,000              | ~362,000                               | **~15.8%**  | ~37.0 KB                   | ~31.4 KB             | `2 + 4 = 6` vs `1 + 4 = 5`                                      |
+//! | `N = 5`        | ~1,075,000                     | ~794,000                               | **~26.1%**  | ~92.5 KB                   | ~68.2 KB             | `5 + 10 = 15` vs `1 + 10 = 11`                                  |
+//! | `N = 10`       | ~2,150,000                     | ~1,514,000                             | **~29.6%**  | ~185.0 KB                  | ~129.5 KB            | `10 + 20 = 30` vs `1 + 20 = 21`                                 |
+//!
+//! *(When `circuit-breaker` is also registered, `batch_check` additionally saves
+//! `N - 1` cross-contract calls to `circuit-breaker.is_frozen()`, increasing the
+//! `N = 2` savings to ~22% and `N = 10` savings to ~36%.)*
+//!
+//! ### Guidance for token issuers
+//!
+//! - **Single-party check (`N = 1`, e.g., `mint(to)` or `burn(from)`)**: Call
+//!   [`ComplianceAggregator::check_address`] directly to avoid allocating a
+//!   single-element `Vec<Address>` and `Vec<ComplianceResult>`.
+//! - **Two-party `transfer(from, to)` (`N = 2`)**:
+//!   - Use **two `check_address` calls** when you want **fail-fast short-circuiting**
+//!     on `from` (saving the second address's downstream primitive calls whenever
+//!     the sender is non-compliant) or simpler per-party error attribution.
+//!   - Use **`batch_check([from, to], allowed_codes)`** when nearly all transfers
+//!     are expected to pass (the common case in pre-KYC'd RWA markets) and you want
+//!     to save ~16–22% of aggregator call/storage overhead.
+//! - **Multi-recipient disbursements, coupon payouts, or batch pre-flight checks
+//!   (`N >= 3..=45`)**: Always prefer [`ComplianceAggregator::batch_check`]
+//!   (`check_all`), which amortizes outer call setup, instance-storage reads, and
+//!   circuit-breaker evaluation across the batch up to [`ComplianceAggregator::MAX_BATCH_SIZE`] (`45`).
+//!
 //! ## Upgradeability
 //!
 //! `upgrade(admin, new_wasm_hash)` lets the configured admin move the

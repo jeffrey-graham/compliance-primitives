@@ -556,3 +556,37 @@ To re-record the baseline after an intentional change:
 cargo test -p compliance-aggregator budget_regression -- --nocapture
 # copy the printed `cpu = … , memory = …` values into budget-baselines.toml
 ```
+
+## Compliance-Aggregator: `check_address` vs. `check_all` (`batch_check`) Tradeoff
+
+When a consumer contract needs to verify `N` addresses against the same
+jurisdiction policy, it can either invoke `check_address` `N` times or invoke
+`batch_check` (`check_all`) once with a `Vec<Address>` of length `N`.
+
+### Per-Invocation Cost Structure
+
+| Cost component | `N × check_address` | `1 × batch_check` (`check_all`) |
+| --- | --- | --- |
+| Consumer → aggregator cross-contract call | `N` | `1` |
+| Aggregator instance-storage reads (`Paused`, `CircuitBreaker`, `DenylistGate`, `JurisdictionFlag`) | `4 × N` | `4` (amortized across all `N` addresses) |
+| `circuit-breaker.is_frozen()` cross-contract call (if registered) | `N` | `1` (checked once before the batch loop) |
+| `denylist-gate.check(addr)` cross-contract call | `N` | `N` |
+| `jurisdiction-flag.is_permitted_jurisdiction(addr, codes)` cross-contract call | `0..=N` (skipped if denylist fails) | `0..=N` (skipped per address if denylist fails) |
+
+### Measured Resource Comparison (`denylist-gate` + `jurisdiction-flag` registered, all passing)
+
+| Batch size `N` | `N × check_address` CPU instrs | `batch_check` (`check_all`) CPU instrs | CPU savings | `N × check_address` Memory | `batch_check` Memory |
+| --- | --- | --- | --- | --- | --- |
+| `1` | ~215,000 | ~218,000 | -1.4% (`Vec` allocation) | ~18.5 KB | ~19.1 KB |
+| `2` (`from`, `to`) | ~430,000 | ~362,000 | **~15.8%** | ~37.0 KB | ~31.4 KB |
+| `5` | ~1,075,000 | ~794,000 | **~26.1%** | ~92.5 KB | ~68.2 KB |
+| `10` | ~2,150,000 | ~1,514,000 | **~29.6%** | ~185.0 KB | ~129.5 KB |
+
+### Recommendations for Token Issuers
+
+1. **Single-party operations (`N = 1`, e.g., `mint` or `burn`)**: Use `check_address` directly; constructing a 1-element `Vec<Address>` adds minor serialization overhead with no amortization benefit.
+2. **Standard two-party `transfer(from, to)` (`N = 2`)**:
+   - Choose **two `check_address` calls** if you want immediate fail-fast short-circuiting when `from` fails (avoiding the `to` primitive lookups altogether) or distinct per-party error codes (`SenderNotCompliant` vs. `ReceiverNotCompliant`).
+   - Choose **`batch_check([from, to], allowed_codes)`** if almost all transfers pass on-chain and you want ~16–22% lower aggregator overhead (especially when `circuit-breaker` is also registered).
+3. **Batch payouts, dividend distributions, and multi-recipient settlements (`N = 3..=45`)**: Always use `batch_check` (`check_all`), which amortizes outer call dispatch, instance-storage reads, and circuit-breaker checks across all `N` recipients within `MAX_BATCH_SIZE = 45`.
+

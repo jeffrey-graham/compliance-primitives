@@ -1178,3 +1178,40 @@ fn test_every_admin_write_path_extends_instance_ttl() {
     client.set_admin(&agg_admin, &new_admin);
     assert_eq!(instance_ttl(&env, &agg_id), INSTANCE_TTL_EXTEND_TO);
 }
+
+#[test]
+fn test_benchmark_check_address_vs_batch_check_cost_tradeoff() {
+    let env = Env::default();
+    let (_agg_admin, _gate_admin, _flag_admin, _gate_id, flag_id, client) = setup_both(&env);
+    let flag_client = JurisdictionFlagClient::new(&env, &flag_id);
+    let allowed = vec![&env, String::from_str(&env, "US")];
+
+    for &n in &[1u32, 2, 5, 10] {
+        let mut addrs = Vec::new(&env);
+        for _ in 0..n {
+            let a = Address::generate(&env);
+            flag_client.set_jurisdiction(& _flag_admin, &a, &String::from_str(&env, "US"));
+            addrs.push_back(a);
+        }
+
+        env.cost_estimate().budget().reset_default();
+        for a in addrs.iter() {
+            let (passed, _) = client.check_address(&a, &allowed);
+            assert!(passed);
+        }
+        let individual_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+
+        env.cost_estimate().budget().reset_default();
+        let batch_res = client.check_all(&addrs, &allowed);
+        assert_eq!(batch_res.len(), n);
+        let batch_cpu = env.cost_estimate().budget().cpu_instruction_cost();
+
+        if n >= 2 {
+            assert!(
+                batch_cpu < individual_cpu,
+                "for N={n}, batch_check ({batch_cpu}) should use fewer CPU instructions than {n}x check_address ({individual_cpu})"
+            );
+        }
+    }
+}
+
