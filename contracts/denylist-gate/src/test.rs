@@ -866,3 +866,34 @@ fn test_propose_upgrade_accepts_minimum_delay() {
         Ok(Ok(()))
     );
 }
+
+#[test]
+fn test_multisig_denylist_mutations_require_threshold_distinct_signers() {
+    let env = Env::default();
+    let (admin, signers, client) = setup_multisig(&env, 3, 2);
+    let signer2 = signers.get_unchecked(1);
+    let outsider = Address::generate(&env);
+    let target = Address::generate(&env);
+
+    // Non-signer is rejected even if multisig is enabled.
+    assert_eq!(
+        client.try_add_to_denylist(&outsider, &target),
+        Err(Ok(Error::NotAuthorized))
+    );
+
+    // First signer approval alone does not yet add `target` to the denylist (2-of-3).
+    client.add_to_denylist(&admin, &target);
+    assert!(client.check(&target));
+
+    // Second distinct signer approval reaches threshold and applies DenyAdd.
+    client.add_to_denylist(&signer2, &target);
+    assert!(!client.check(&target));
+
+    // Removing `target` also requires 2-of-3 distinct signer approvals.
+    client.remove_from_denylist(&admin, &target);
+    assert!(!client.check(&target));
+
+    client.remove_from_denylist(&signer2, &target);
+    assert!(client.check(&target));
+}
+

@@ -109,13 +109,16 @@ pub struct SignerSet {
     pub threshold: u32,
 }
 
-/// A signer-set change that needs `threshold` distinct approvals to apply.
+/// A signer-set or denylist action that needs `threshold` distinct approvals to apply
+/// when multisig mode (`DataKey::SignerSet`) is enabled.
 #[contracttype]
 #[derive(Clone)]
 pub enum SignerAction {
     Add(Address),
     Remove(Address),
     SetThreshold(u32),
+    DenyAdd(Address),
+    DenyRemove(Address),
 }
 
 #[contractclient(name = "AuditLogClient")]
@@ -546,47 +549,47 @@ impl DenylistGate {
         Ok(())
     }
 
-    /// Add `address` to the denylist. Admin or compliance-officer.
+    /// Add `address` to the denylist.
+    ///
+    /// - In single-admin mode (`DataKey::SignerSet` not set), requires the
+    ///   stored `admin` or configured `compliance_officer`.
+    /// - When multisig mode (`DataKey::SignerSet`) is enabled, requires either
+    ///   the configured `compliance_officer` (immediate execution) or a current
+    ///   member of `SignerSet::signers`, applying the denylist addition once
+    ///   `threshold` distinct signers have approved `SignerAction::DenyAdd(address)`.
     ///
     /// Uses persistent storage with a long TTL to avoid fail-open archival.
-    ///
-    /// Persistent denylist entries receive an explicit long TTL because their
-    /// reads can happen independently of instance-storage activity. Instance
-    /// configuration keys do not need the same treatment: Soroban bumps the
-    /// instance entry TTL when this contract is invoked.
     pub fn add_to_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
-        Self::require_compliance_authority(&env, &admin)?;
-
-        const MAX_TTL: u32 = 6_311_520;
-        const THRESHOLD: u32 = MAX_TTL / 2;
-
-        let key = DataKey::Denied(address.clone());
-        env.storage().persistent().set(&key, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, THRESHOLD, MAX_TTL);
-
-        DenyAdd {
-            address: address.clone(),
+        if env.storage().instance().has(&DataKey::SignerSet)
+            && !Self::is_compliance_officer(&env, &admin)
+        {
+            let signer_set = Self::require_signer(&env, &admin)?;
+            return Self::approve(&env, admin, SignerAction::DenyAdd(address), signer_set);
         }
-        .publish(&env);
-        Self::record_audit(&env, Symbol::new(&env, "deny_add"), &address, "address added to denylist");
+        Self::require_compliance_authority(&env, &admin)?;
+        Self::apply_deny_add(&env, address);
         Ok(())
     }
 
-    /// Remove `address` from the denylist. Admin or compliance-officer.
+    /// Remove `address` from the denylist.
+    ///
+    /// - In single-admin mode (`DataKey::SignerSet` not set), requires the
+    ///   stored `admin` or configured `compliance_officer`.
+    /// - When multisig mode (`DataKey::SignerSet`) is enabled, requires either
+    ///   the configured `compliance_officer` (immediate execution) or a current
+    ///   member of `SignerSet::signers`, applying the removal once `threshold`
+    ///   distinct signers have approved `SignerAction::DenyRemove(address)`.
     pub fn remove_from_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
-        Self::require_compliance_authority(&env, &admin)?;
-        env.storage()
-            .persistent()
-            .remove(&DataKey::Denied(address.clone()));
-        DenyRemove {
-            address: address.clone(),
+        if env.storage().instance().has(&DataKey::SignerSet)
+            && !Self::is_compliance_officer(&env, &admin)
+        {
+            let signer_set = Self::require_signer(&env, &admin)?;
+            return Self::approve(&env, admin, SignerAction::DenyRemove(address), signer_set);
         }
-        .publish(&env);
-        Self::record_audit(&env, Symbol::new(&env, "deny_remove"), &address, "address removed from denylist");
+        Self::require_compliance_authority(&env, &admin)?;
+        Self::apply_deny_remove(&env, address);
         Ok(())
     }
 
@@ -817,8 +820,59 @@ impl DenylistGate {
                 }
                 .publish(env);
             }
+            SignerAction::DenyAdd(address) => {
+                Self::apply_deny_add(env, address);
+            }
+            SignerAction::DenyRemove(address) => {
+                Self::apply_deny_remove(env, address);
+            }
         }
         Ok(())
+    }
+
+    fn is_compliance_officer(env: &Env, caller: &Address) -> bool {
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::ComplianceOfficer)
+            == Some(caller.clone())
+    }
+
+    fn apply_deny_add(env: &Env, address: Address) {
+        const MAX_TTL: u32 = 6_311_520;
+        const THRESHOLD: u32 = MAX_TTL / 2;
+
+        let key = DataKey::Denied(address.clone());
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, THRESHOLD, MAX_TTL);
+
+        DenyAdd {
+            address: address.clone(),
+        }
+        .publish(env);
+        Self::record_audit(
+            env,
+            Symbol::new(env, "deny_add"),
+            &address,
+            "address added to denylist",
+        );
+    }
+
+    fn apply_deny_remove(env: &Env, address: Address) {
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Denied(address.clone()));
+        DenyRemove {
+            address: address.clone(),
+        }
+        .publish(env);
+        Self::record_audit(
+            env,
+            Symbol::new(env, "deny_remove"),
+            &address,
+            "address removed from denylist",
+        );
     }
 
     fn require_admin(env: &Env, admin: &Address) -> Result<(), Error> {
