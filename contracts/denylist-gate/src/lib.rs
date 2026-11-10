@@ -546,6 +546,14 @@ impl DenylistGate {
         Ok(())
     }
 
+    /// Returns `true` if the contract is currently paused, `false` otherwise.
+    pub fn is_paused(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&DataKey::Paused)
+            .unwrap_or(false)
+    }
+
     /// Add `address` to the denylist. Admin or compliance-officer.
     ///
     /// Uses persistent storage with a long TTL to avoid fail-open archival.

@@ -866,3 +866,18 @@ fn test_propose_upgrade_accepts_minimum_delay() {
         Ok(Ok(()))
     );
 }
+
+#[test]
+fn test_is_paused_reflects_pause_and_unpause() {
+    let env = Env::default();
+    let (admin, _contract_id, client) = setup(&env);
+
+    assert!(!client.is_paused());
+
+    client.pause(&admin);
+    assert!(client.is_paused());
+
+    client.unpause(&admin);
+    assert!(!client.is_paused());
+}
+
