@@ -866,3 +866,170 @@ fn test_propose_upgrade_accepts_minimum_delay() {
         Ok(Ok(()))
     );
 }
+
+#[test]
+fn test_pending_approvals_stored_in_persistent_storage_and_expire_after_ttl() {
+    let env = Env::default();
+    let (admin, signers, client) = setup_multisig(&env, 3, 2);
+    let signer2 = signers.get_unchecked(1);
+    let candidate = Address::generate(&env);
+    let action = crate::SignerAction::Add(candidate.clone());
+    let key = DataKey::PendingSignerAction(action.clone());
+
+    client.add_signer(&admin, &candidate);
+    assert_eq!(client.pending_approvals(&action), vec![&env, admin.clone()]);
+
+    // Verify pending approvals live in persistent storage (not instance storage)
+    // and receive APPROVAL_TTL_LEDGERS TTL.
+    env.as_contract(&client.address, || {
+        assert!(!env.storage().instance().has(&key));
+        assert!(env.storage().persistent().has(&key));
+        assert_eq!(
+            env.storage().persistent().get_ttl(&key),
+            crate::APPROVAL_TTL_LEDGERS
+        );
+    });
+
+    // At the exact boundary (created_at + APPROVAL_TTL_LEDGERS), the approval is still active.
+    let start_seq = env.ledger().sequence();
+    env.ledger()
+        .set_sequence_number(start_seq + crate::APPROVAL_TTL_LEDGERS);
+    assert_eq!(client.pending_approvals(&action), vec![&env, admin.clone()]);
+
+    // One ledger past APPROVAL_TTL_LEDGERS, `admin`'s partial approval expires.
+    env.ledger()
+        .set_sequence_number(start_seq + crate::APPROVAL_TTL_LEDGERS + 1);
+    assert_eq!(client.pending_approvals(&action), vec![&env]);
+
+    // `signer2` approving after `admin`'s approval expired only counts as 1-of-2,
+    // so `candidate` is not added until another fresh approval arrives.
+    client.add_signer(&signer2, &candidate);
+    assert_eq!(client.signers().len(), 3);
+    assert_eq!(
+        client.pending_approvals(&action),
+        vec![&env, signer2.clone()]
+    );
+
+    client.add_signer(&admin, &candidate);
+    assert_eq!(client.signers().len(), 4);
+    assert_eq!(client.pending_approvals(&action), vec![&env]);
+    env.as_contract(&client.address, || {
+        assert!(!env.storage().persistent().has(&key));
+    });
+}
+
+#[test]
+fn test_revoke_approval_removes_pending_approval_before_threshold() {
+    let env = Env::default();
+    let (admin, signers, client) = setup_multisig(&env, 3, 2);
+    let signer2 = signers.get_unchecked(1);
+    let candidate = Address::generate(&env);
+    let action = crate::SignerAction::Add(candidate.clone());
+    let key = DataKey::PendingSignerAction(action.clone());
+
+    client.add_signer(&admin, &candidate);
+    assert_eq!(client.pending_approvals(&action), vec![&env, admin.clone()]);
+
+    // `admin` revokes their pending approval before `signer2` votes, removing the
+    // persistent entry when no active approvals remain.
+    client.revoke_approval(&admin, &action);
+    assert_eq!(client.pending_approvals(&action), vec![&env]);
+    env.as_contract(&client.address, || {
+        assert!(!env.storage().persistent().has(&key));
+    });
+
+    // `signer2`'s approval alone no longer completes the 2-of-3 action.
+    client.add_signer(&signer2, &candidate);
+    assert_eq!(client.signers().len(), 3);
+}
+
+#[test]
+fn test_revoke_approval_auth_and_partial_revocation() {
+    let env = Env::default();
+
+    // Multisig not enabled -> MultisigNotEnabled
+    let (single_admin, _id, single_client) = setup(&env);
+    let candidate = Address::generate(&env);
+    let action = crate::SignerAction::Add(candidate.clone());
+    assert_eq!(
+        single_client.try_revoke_approval(&single_admin, &action),
+        Err(Ok(Error::MultisigNotEnabled))
+    );
+    assert_eq!(single_client.pending_approvals(&action), vec![&env]);
+
+    // 3-of-3 multisig: non-signer rejected, partial revocation keeps other signer's vote.
+    let (admin, signers, client) = setup_multisig(&env, 3, 3);
+    let signer2 = signers.get_unchecked(1);
+    let signer3 = signers.get_unchecked(2);
+    let outsider = Address::generate(&env);
+
+    client.add_signer(&admin, &candidate);
+    client.add_signer(&signer2, &candidate);
+    assert_eq!(
+        client.pending_approvals(&action),
+        vec![&env, admin.clone(), signer2.clone()]
+    );
+
+    assert_eq!(
+        client.try_revoke_approval(&outsider, &action),
+        Err(Ok(Error::NotAuthorized))
+    );
+    assert_eq!(
+        client.pending_approvals(&action),
+        vec![&env, admin.clone(), signer2.clone()]
+    );
+
+    // Unapproved signer3 revoking is a safe no-op for existing votes.
+    client.revoke_approval(&signer3, &action);
+    assert_eq!(
+        client.pending_approvals(&action),
+        vec![&env, admin.clone(), signer2.clone()]
+    );
+
+    // `admin` revokes only their own vote; `signer2`'s vote remains active.
+    client.revoke_approval(&admin, &action);
+    assert_eq!(
+        client.pending_approvals(&action),
+        vec![&env, signer2.clone()]
+    );
+}
+
+#[test]
+fn test_removed_signer_approval_ignored_and_legacy_instance_key_purged() {
+    let env = Env::default();
+    let (admin, signers, client) = setup_multisig(&env, 3, 2);
+    let signer2 = signers.get_unchecked(1);
+    let signer3 = signers.get_unchecked(2);
+    let candidate = Address::generate(&env);
+    let add_action = crate::SignerAction::Add(candidate.clone());
+    let key = DataKey::PendingSignerAction(add_action.clone());
+
+    // Seed a pre-upgrade legacy `Vec<Address>` entry in instance storage and confirm
+    // `add_signer` purges it without deserializing the old shape.
+    env.as_contract(&client.address, || {
+        env.storage()
+            .instance()
+            .set(&key, &vec![&env, admin.clone()]);
+        assert!(env.storage().instance().has(&key));
+    });
+
+    // `signer3` approves adding `candidate`, then `admin` + `signer2` remove `signer3`.
+    client.add_signer(&signer3, &candidate);
+    env.as_contract(&client.address, || {
+        assert!(!env.storage().instance().has(&key));
+    });
+    assert_eq!(
+        client.pending_approvals(&add_action),
+        vec![&env, signer3.clone()]
+    );
+
+    client.remove_signer(&admin, &signer3);
+    client.remove_signer(&signer2, &signer3);
+    assert_eq!(client.signers().len(), 2);
+
+    // `signer3`'s prior approval no longer counts after removal from `SignerSet`.
+    assert_eq!(client.pending_approvals(&add_action), vec![&env]);
+    client.add_signer(&admin, &candidate);
+    assert_eq!(client.signers().len(), 2);
+}
+

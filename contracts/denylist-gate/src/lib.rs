@@ -39,11 +39,14 @@
 //!   the *current* signer set; any other address is rejected with
 //!   `NotAuthorized`.
 //! - A change does not take effect on a single signer's say-so. Each call
-//!   records one approval from `caller` for that exact action (add X / remove
-//!   X). Approvals are per action and de-duplicated per signer, so one signer
-//!   calling twice still counts once. The change is applied, and its pending
-//!   approvals cleared, only once `threshold` distinct current signers have
-//!   approved it.
+//!   records one timestamped approval from `caller` in persistent storage for
+//!   that exact action (add X / remove X), bounded by [`APPROVAL_TTL_LEDGERS`].
+//!   Approvals are per action, expire after [`APPROVAL_TTL_LEDGERS`] ledgers,
+//!   and are de-duplicated per signer, so one signer calling twice still counts
+//!   once. A signer can withdraw an unexecuted vote via `revoke_approval`, and
+//!   active votes can be inspected via `pending_approvals`. The change is
+//!   applied, and its pending approvals cleared, only once `threshold` distinct
+//!   current signers hold non-expired approvals for it.
 //! - Removals are validated before an approval is recorded: the set can never
 //!   shrink to empty, nor below the threshold (`InvalidSignerSet` /
 //!   `InvalidThreshold`). To remove a signer from a set that is already at its
@@ -86,7 +89,8 @@ enum DataKey {
     SignerSet,
     Denied(Address),
     PendingUpgrade,
-    /// Approvals collected so far for one pending signer-set change.
+    /// Approvals collected so far for one pending signer-set change (`Vec<PendingApproval>`).
+    /// Stored in persistent storage with TTL [`APPROVAL_TTL_LEDGERS`].
     PendingSignerAction(SignerAction),
 }
 
@@ -100,6 +104,22 @@ pub struct UpgradeState {
 
 /// Current on-chain schema version for this contract instance.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// Number of ledgers for which a pending multisig signer approval remains
+/// valid (~7 days at 5 seconds per ledger). Approvals older than this window
+/// are treated as expired, and persistent `PendingSignerAction` entries are
+/// given this TTL so abandoned proposals expire automatically without bloating
+/// instance storage.
+pub const APPROVAL_TTL_LEDGERS: u32 = 120_960;
+
+/// A single signer's approval for a pending [`SignerAction`], stamped with the
+/// ledger sequence at which it was recorded.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingApproval {
+    pub signer: Address,
+    pub created_at_ledger: u32,
+}
 
 /// The M-of-N signer set.
 #[contracttype]
@@ -732,6 +752,74 @@ impl DenylistGate {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Withdraw `caller`'s pending approval for `action` before `threshold` is
+    /// reached. `caller` must authorize the call and belong to the current
+    /// signer set. If no active approvals remain for `action`, its persistent
+    /// storage entry is removed immediately.
+    pub fn revoke_approval(
+        env: Env,
+        caller: Address,
+        action: SignerAction,
+    ) -> Result<(), Error> {
+        let signer_set = Self::require_signer(&env, &caller)?;
+        let key = DataKey::PendingSignerAction(action);
+        // Purge any pre-upgrade legacy instance-storage entry for this action.
+        env.storage().instance().remove(&key);
+        let stored: Vec<PendingApproval> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let now = env.ledger().sequence();
+        let mut remaining = Vec::new(&env);
+        for entry in stored.iter() {
+            let not_expired = now.saturating_sub(entry.created_at_ledger) <= APPROVAL_TTL_LEDGERS;
+            if entry.signer != caller
+                && not_expired
+                && Self::contains(&signer_set.signers, &entry.signer)
+            {
+                remaining.push_back(entry);
+            }
+        }
+        if remaining.is_empty() {
+            env.storage().persistent().remove(&key);
+        } else {
+            env.storage().persistent().set(&key, &remaining);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, APPROVAL_TTL_LEDGERS, APPROVAL_TTL_LEDGERS);
+        }
+        Ok(())
+    }
+
+    /// Return the addresses of current signers whose approvals for `action` are
+    /// still active (not expired under [`APPROVAL_TTL_LEDGERS`]).
+    pub fn pending_approvals(env: Env, action: SignerAction) -> Vec<Address> {
+        let Some(signer_set) = env
+            .storage()
+            .instance()
+            .get::<_, SignerSet>(&DataKey::SignerSet)
+        else {
+            return Vec::new(&env);
+        };
+        let key = DataKey::PendingSignerAction(action);
+        let stored: Vec<PendingApproval> = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .unwrap_or_else(|| Vec::new(&env));
+        let now = env.ledger().sequence();
+        let mut active = Vec::new(&env);
+        for entry in stored.iter() {
+            if now.saturating_sub(entry.created_at_ledger) <= APPROVAL_TTL_LEDGERS
+                && Self::contains(&signer_set.signers, &entry.signer)
+            {
+                active.push_back(entry.signer);
+            }
+        }
+        active
+    }
+
     // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
@@ -755,8 +843,10 @@ impl DenylistGate {
         Ok(signer_set)
     }
 
-    /// Records `caller`'s approval of `action` and applies it once `threshold`
-    /// distinct signers have approved.
+    /// Records `caller`'s approval of `action` in persistent storage with a
+    /// bounded TTL ([`APPROVAL_TTL_LEDGERS`]), prunes expired or non-member
+    /// approvals, and applies `action` once `threshold` distinct signers have
+    /// non-expired approvals.
     fn approve(
         env: &Env,
         caller: Address,
@@ -764,29 +854,42 @@ impl DenylistGate {
         mut signer_set: SignerSet,
     ) -> Result<(), Error> {
         let key = DataKey::PendingSignerAction(action.clone());
-        let mut approvals: Vec<Address> = env
+        // Purge any pre-upgrade legacy instance-storage entry for this action.
+        env.storage().instance().remove(&key);
+        let stored: Vec<PendingApproval> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&key)
             .unwrap_or_else(|| Vec::new(env));
-        if !Self::contains(&approvals, &caller) {
-            approvals.push_back(caller.clone());
-        }
-        SignerApproved { signer: caller }.publish(env);
+        let now = env.ledger().sequence();
 
-        // Only approvals from signers still in the set count towards the threshold.
-        let mut valid = 0u32;
-        for approver in approvals.iter() {
-            if Self::contains(&signer_set.signers, &approver) {
-                valid += 1;
+        // Keep only non-expired approvals from current signers, replacing any
+        // prior approval from `caller` with a fresh timestamp.
+        let mut approvals: Vec<PendingApproval> = Vec::new(env);
+        for entry in stored.iter() {
+            let not_expired = now.saturating_sub(entry.created_at_ledger) <= APPROVAL_TTL_LEDGERS;
+            if entry.signer != caller
+                && not_expired
+                && Self::contains(&signer_set.signers, &entry.signer)
+            {
+                approvals.push_back(entry);
             }
         }
-        if valid < signer_set.threshold {
-            env.storage().instance().set(&key, &approvals);
+        approvals.push_back(PendingApproval {
+            signer: caller.clone(),
+            created_at_ledger: now,
+        });
+        SignerApproved { signer: caller }.publish(env);
+
+        if approvals.len() < signer_set.threshold {
+            env.storage().persistent().set(&key, &approvals);
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, APPROVAL_TTL_LEDGERS, APPROVAL_TTL_LEDGERS);
             return Ok(());
         }
 
-        env.storage().instance().remove(&key);
+        env.storage().persistent().remove(&key);
         match action {
             SignerAction::Add(new_signer) => {
                 signer_set.signers.push_back(new_signer.clone());
