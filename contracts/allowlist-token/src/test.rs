@@ -942,6 +942,38 @@ fn test_get_delegated_nonce_is_zero_before_any_delegated_call() {
 }
 
 #[test]
+fn test_instance_ttl_extended_on_initialize_and_mutations() {
+    use soroban_sdk::testutils::{storage::Instance as _, Ledger as _};
+    let env = Env::default();
+    let (admin, _token_id, contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let new_admin = Address::generate(&env);
+
+    let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    assert_eq!(ttl, crate::INSTANCE_TTL_EXTEND_TO);
+
+    let step = crate::INSTANCE_TTL_EXTEND_TO - crate::INSTANCE_TTL_THRESHOLD + 1;
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + step);
+    let aged_ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    assert!(aged_ttl < crate::INSTANCE_TTL_THRESHOLD);
+
+    client.add_to_allowlist(&admin, &alice, &None);
+    let refreshed_ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    assert_eq!(refreshed_ttl, crate::INSTANCE_TTL_EXTEND_TO);
+
+    client.propose_admin(&admin, &new_admin);
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + step);
+    let aged_again = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    assert!(aged_again < crate::INSTANCE_TTL_THRESHOLD);
+
+    client.accept_admin(&new_admin);
+    let refreshed_on_accept = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    assert_eq!(refreshed_on_accept, crate::INSTANCE_TTL_EXTEND_TO);
+}
+
+#[test]
 fn test_get_delegated_nonce_returns_last_used_nonce() {
     let env = Env::default();
     let (admin, _token_id, _contract_id, client) = setup(&env);

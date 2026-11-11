@@ -137,3 +137,26 @@ entrypoint:
    a breaking storage-layout change is `complexity: high` regardless of how
    small the code diff looks — it changes a compatibility commitment to
    every live deployment of that contract.
+
+## Instance and Persistent Storage TTL Policy
+
+Soroban does **not** automatically extend a contract's instance-storage TTL or
+persistent-storage TTL when the contract is invoked. If a contract's instance
+storage expires and is archived, `DataKey::Admin`, `DataKey::Issuer`, and
+`DataKey::Paused` become unreadable until restored, which could either brick
+administrative operations or cause fail-open reads if not guarded.
+
+To prevent unintended archival, all stateful compliance primitives enforce a
+uniform TTL extension policy on every state-mutating entrypoint:
+
+| Constant | Value (ledgers) | Wall-clock (~5s/ledger) | Purpose |
+| --- | --- | --- | --- |
+| `INSTANCE_TTL_THRESHOLD` | `120_960` | ~7 days | Minimum remaining TTL below which `env.storage().instance().extend_ttl(...)` bumps the instance TTL |
+| `INSTANCE_TTL_EXTEND_TO` | `1_555_200` | ~90 days | Target remaining TTL after an instance storage extension |
+
+### Per-Contract Coverage
+
+- **`allowlist-token`**: Calls `extend_instance_ttl` on `initialize`, `accept_admin`, `transfer`, and all admin/compliance-officer write paths (`set_delegated_admin_key`, `add_to_allowlist`, `add_multiple_to_allowlist`, `add_to_allowlist_delegated`, `remove_from_allowlist`, `remove_multiple_from_allowlist`, `pause`, `unpause`, `propose_admin`, `transfer_admin`, `set_compliance_officer`, `revoke_compliance_officer`, `propose_upgrade`, `commit_upgrade`, `cancel_upgrade`). Persistent `DataKey::Allowed(Address)` entries are likewise extended on write and on `transfer`.
+- **`denylist-gate`**: Calls `extend_instance_ttl` on `initialize`, `accept_admin`, and all admin, compliance-officer, and multisig signer write paths (`add_to_denylist`, `remove_from_denylist`, `remove_multiple_from_denylist`, `pause`, `unpause`, `propose_admin`, `cancel_admin_proposal`, `transfer_admin`, `set_compliance_officer`, `revoke_compliance_officer`, `set_audit_log`, `clear_audit_log`, `initialize_multisig`, `add_signer`, `remove_signer`, `set_threshold`, `propose_upgrade`, `commit_upgrade`, `cancel_upgrade`). Persistent `DataKey::Denied(Address)` entries receive a long ~1-year TTL (`6_311_520` ledgers) on write so sanctioned addresses do not silently expire between administrative touches.
+- **`jurisdiction-flag`**: Calls `extend_instance_ttl` on `initialize`, `accept_issuer`, and all issuer/compliance-officer write paths (`set_jurisdiction`, `set_multiple_jurisdictions`, `set_jurisdiction_until`, `add_jurisdiction`, `remove_jurisdiction`, `remove_jurisdiction_multiple`, `pause`, `unpause`, `propose_issuer`, `cancel_issuer_proposal`, `transfer_issuer`, `set_compliance_officer`, `revoke_compliance_officer`, `upgrade`), and extends persistent `DataKey::Jurisdictions(Address)` / `DataKey::ValidUntil(Address)` entries on both writes and active reads.
+- **`circuit-breaker`, `compliance-aggregator`, `policy-engine`, & `multisig-admin`**: Call `extend_instance_ttl` (`120_960` / `1_555_200` ledgers) on `initialize` and every administrative configuration change.

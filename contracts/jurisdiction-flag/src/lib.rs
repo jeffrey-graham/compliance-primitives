@@ -43,6 +43,20 @@ const TTL_THRESHOLD: u32 = 120_960;
 /// Target 1,555,200 ledgers (~90 days) after extension.
 const TTL_EXTEND_TO: u32 = 1_555_200;
 
+/// Extend the contract's instance storage when its remaining TTL drops below
+/// this many ledgers (~7 days at ~5s/ledger).
+pub const INSTANCE_TTL_THRESHOLD: u32 = 120_960;
+
+/// Target remaining TTL, in ledgers, after an instance TTL extension (~90 days
+/// at ~5s/ledger).
+pub const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200;
+
+fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+}
+
 /// Maximum number of entries accepted by `set_multiple_jurisdictions` in a
 /// single call. Keeps transaction costs bounded and prevents resource
 /// exhaustion.
@@ -196,6 +210,7 @@ impl JurisdictionFlag {
         issuer.require_auth();
         env.storage().instance().set(&DataKey::Issuer, &issuer);
         env.storage().instance().set(&DataKey::Paused, &false);
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -273,6 +288,7 @@ impl JurisdictionFlag {
             .ok_or(Error::NotInitialized)?;
         env.storage().instance().set(&DataKey::Issuer, &new_issuer);
         env.storage().instance().remove(&DataKey::PendingIssuer);
+        extend_instance_ttl(&env);
         IssuerTransferred {
             old_issuer,
             new_issuer,
@@ -670,6 +686,7 @@ impl JurisdictionFlag {
         if stored_issuer != *issuer {
             return Err(Error::NotAuthorized);
         }
+        extend_instance_ttl(env);
         Ok(())
     }
 
@@ -706,6 +723,7 @@ impl JurisdictionFlag {
             .get(&DataKey::Issuer)
             .ok_or(Error::NotInitialized)?;
         if stored_issuer == *caller {
+            extend_instance_ttl(env);
             return Ok(());
         }
         if let Some(officer) = env
@@ -714,6 +732,7 @@ impl JurisdictionFlag {
             .get::<DataKey, Address>(&DataKey::ComplianceOfficer)
         {
             if officer == *caller {
+                extend_instance_ttl(env);
                 return Ok(());
             }
         }

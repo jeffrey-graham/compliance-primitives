@@ -71,6 +71,20 @@ pub(crate) const ALLOWED_TTL_THRESHOLD: u32 = 120_960; // ~7 days
 /// Target remaining TTL after extension (~90 days at ~5s/ledger).
 pub(crate) const ALLOWED_TTL_EXTEND_TO: u32 = 1_555_200; // ~90 days
 
+/// Extend the contract's instance storage when its remaining TTL drops below
+/// this many ledgers (~7 days at ~5s/ledger).
+pub const INSTANCE_TTL_THRESHOLD: u32 = 120_960;
+
+/// Target remaining TTL, in ledgers, after an instance TTL extension (~90 days
+/// at ~5s/ledger).
+pub const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200;
+
+fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+}
+
 /// Maximum number of addresses accepted by a batch allowlist operation.
 pub const MAX_BATCH_SIZE: u32 = 45;
 
@@ -226,6 +240,7 @@ impl AllowlistToken {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Token, &token);
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -396,6 +411,7 @@ impl AllowlistToken {
     pub fn remove_from_allowlist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
         Self::require_compliance_authority(&env, &admin)?;
+        extend_instance_ttl(&env);
         env.storage()
             .persistent()
             .remove(&DataKey::Allowed(address.clone()));
@@ -414,6 +430,7 @@ impl AllowlistToken {
         if addresses.len() > MAX_BATCH_SIZE {
             return Err(Error::BatchTooLarge);
         }
+        extend_instance_ttl(&env);
 
         for address in addresses.iter() {
             env.storage()
@@ -489,6 +506,7 @@ impl AllowlistToken {
             .ok_or(Error::NotInitialized)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        extend_instance_ttl(&env);
         AdminTransferred { old_admin, new_admin }.publish(&env);
         Ok(())
     }
@@ -714,6 +732,7 @@ impl AllowlistToken {
             .instance()
             .get(&DataKey::Token)
             .ok_or(Error::NotInitialized)?;
+        extend_instance_ttl(&env);
         let token_client = token::Client::new(&env, &token_address);
         token_client.transfer(&from, &to, &amount);
         Ok(true)
@@ -737,6 +756,7 @@ impl AllowlistToken {
         if stored_admin != *admin {
             return Err(Error::NotAuthorized);
         }
+        extend_instance_ttl(env);
         Ok(())
     }
 

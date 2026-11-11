@@ -1171,3 +1171,36 @@ fn test_add_jurisdiction_at_boundary_accepts_up_to_cap() {
         super::MAX_CODES_PER_ADDRESS
     );
 }
+
+#[test]
+fn test_instance_ttl_extended_on_initialize_and_mutations() {
+    use soroban_sdk::testutils::{storage::Instance as _, Ledger as _};
+    let env = Env::default();
+    let (issuer, contract_id, client) = setup(&env);
+    let alice = Address::generate(&env);
+    let new_issuer = Address::generate(&env);
+
+    let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    assert_eq!(ttl, crate::INSTANCE_TTL_EXTEND_TO);
+
+    let step = crate::INSTANCE_TTL_EXTEND_TO - crate::INSTANCE_TTL_THRESHOLD + 1;
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + step);
+    let aged_ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    assert!(aged_ttl < crate::INSTANCE_TTL_THRESHOLD);
+
+    client.set_jurisdiction(&issuer, &alice, &String::from_str(&env, "US"));
+    let refreshed_ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    assert_eq!(refreshed_ttl, crate::INSTANCE_TTL_EXTEND_TO);
+
+    client.propose_issuer(&issuer, &new_issuer);
+    env.ledger()
+        .set_sequence_number(env.ledger().sequence() + step);
+    let aged_again = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    assert!(aged_again < crate::INSTANCE_TTL_THRESHOLD);
+
+    client.accept_issuer(&new_issuer);
+    let refreshed_on_accept = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
+    assert_eq!(refreshed_on_accept, crate::INSTANCE_TTL_EXTEND_TO);
+}
+

@@ -101,6 +101,20 @@ pub struct UpgradeState {
 /// Current on-chain schema version for this contract instance.
 pub const SCHEMA_VERSION: u32 = 1;
 
+/// Extend the contract's instance storage when its remaining TTL drops below
+/// this many ledgers (~7 days at ~5s/ledger).
+pub const INSTANCE_TTL_THRESHOLD: u32 = 120_960;
+
+/// Target remaining TTL, in ledgers, after an instance TTL extension (~90 days
+/// at ~5s/ledger).
+pub const INSTANCE_TTL_EXTEND_TO: u32 = 1_555_200;
+
+fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+}
+
 /// The M-of-N signer set.
 #[contracttype]
 #[derive(Clone)]
@@ -295,6 +309,7 @@ impl DenylistGate {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -382,6 +397,7 @@ impl DenylistGate {
             .ok_or(Error::NotInitialized)?;
         env.storage().instance().set(&DataKey::Admin, &new_admin);
         env.storage().instance().remove(&DataKey::PendingAdmin);
+        extend_instance_ttl(&env);
         AdminTransferred { old_admin, new_admin }.publish(&env);
         Ok(())
     }
@@ -550,10 +566,10 @@ impl DenylistGate {
     ///
     /// Uses persistent storage with a long TTL to avoid fail-open archival.
     ///
-    /// Persistent denylist entries receive an explicit long TTL because their
-    /// reads can happen independently of instance-storage activity. Instance
-    /// configuration keys do not need the same treatment: Soroban bumps the
-    /// instance entry TTL when this contract is invoked.
+    /// Both the persistent `DataKey::Denied(address)` entry and the contract's
+    /// instance storage (`DataKey::Admin`, `DataKey::Paused`, etc.) have their
+    /// TTLs explicitly extended on writes because Soroban does not
+    /// automatically bump instance or persistent TTLs on contract invocation.
     pub fn add_to_denylist(env: Env, admin: Address, address: Address) -> Result<(), Error> {
         Self::reject_if_paused(&env)?;
         Self::require_compliance_authority(&env, &admin)?;
@@ -752,6 +768,7 @@ impl DenylistGate {
         if !Self::contains(&signer_set.signers, caller) {
             return Err(Error::NotAuthorized);
         }
+        extend_instance_ttl(env);
         Ok(signer_set)
     }
 
@@ -831,6 +848,7 @@ impl DenylistGate {
         if stored_admin != *admin {
             return Err(Error::NotAuthorized);
         }
+        extend_instance_ttl(env);
         Ok(())
     }
 
@@ -842,11 +860,13 @@ impl DenylistGate {
             .get(&DataKey::Admin)
             .ok_or(Error::NotInitialized)?;
         if admin == *caller {
+            extend_instance_ttl(env);
             return Ok(());
         }
         if env.storage().instance().get::<DataKey, Address>(&DataKey::ComplianceOfficer)
             == Some(caller.clone())
         {
+            extend_instance_ttl(env);
             return Ok(());
         }
         Err(Error::NotAuthorized)
